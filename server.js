@@ -404,6 +404,7 @@ app.post('/api/download', async (req, res) => {
 
       stream.on('error', async (err) => {
         if (responded) return;
+        console.log('Stream error, trying yt-dlp fallback:', err.message);
         try {
           const fallback = progressId
             ? await downloadWithYtDlpStreaming(url, { audioOnly: false, progressId })
@@ -436,13 +437,14 @@ app.post('/api/download', async (req, res) => {
 
       stream.pipe(write);
     } catch (infoError) {
+      console.log('ytdl-core failed, trying yt-dlp fallback:', infoError.message);
       try {
         const fallback = req.body?.progressId
           ? await downloadWithYtDlpStreaming(url, { audioOnly: false, progressId: req.body.progressId })
           : await downloadWithYtDlp(url, { audioOnly: false });
         return res.json(fallback);
       } catch (fallbackErr) {
-        console.error('Error getting video info:', infoError.message);
+        console.error('Both ytdl-core and yt-dlp failed:', infoError.message, fallbackErr.message);
         if (req.body?.progressId) finishProgress(req.body.progressId, false, { error: infoError.message });
         return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; yt-dlp fallback failed: ${fallbackErr.message}` });
       }
