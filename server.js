@@ -38,6 +38,14 @@ if (ffmpegPath) {
   ffmpeg.setFfmpegPath(ffmpegPath);
 }
 
+// Ensure downloads directory exists at startup (important for Render/local storage)
+try {
+  const downloadsDir = path.join(process.cwd(), 'downloads');
+  if (!fs.existsSync(downloadsDir)) {
+    fs.mkdirSync(downloadsDir, { recursive: true });
+  }
+} catch {}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
