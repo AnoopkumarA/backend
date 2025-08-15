@@ -54,6 +54,10 @@ app.use('/downloads', express.static(path.join(process.cwd(), 'downloads'), { in
 
 // In-memory progress state for SSE
 const progressStates = new Map();
+// Rate limiting: track last request time to avoid hitting YouTube limits
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 5000; // 5 seconds between requests
+
 // Cleanup any debug watch files that may exist so they never get served or deployed
 try {
   const root = process.cwd();
@@ -114,7 +118,7 @@ app.get('/api/progress/:id/json', (req, res) => {
 
 const DEFAULT_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
   'DNT': '1',
@@ -123,7 +127,11 @@ const DEFAULT_HEADERS = {
   'Sec-Fetch-Dest': 'document',
   'Sec-Fetch-Mode': 'navigate',
   'Sec-Fetch-Site': 'none',
-  'Cache-Control': 'max-age=0'
+  'Sec-Fetch-User': '?1',
+  'Cache-Control': 'max-age=0',
+  'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"'
 };
 
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
@@ -398,6 +406,17 @@ app.post('/api/download', async (req, res) => {
     if (!url || !ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid URL' });
     }
+    
+    // Rate limiting: ensure minimum time between requests
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTime;
+    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+      const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+      console.log(`Rate limiting: waiting ${waitTime}ms before processing request`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+    lastRequestTime = Date.now();
+    
     if (progressId) initProgress(progressId);
 
     // Check if we have cookies - if so, go straight to youtube-dl-exec
@@ -537,6 +556,17 @@ app.post('/api/download-mp3', async (req, res) => {
     if (!url || !ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid URL' });
     }
+    
+    // Rate limiting: ensure minimum time between requests
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTime;
+    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+      const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+      console.log(`Rate limiting: waiting ${waitTime}ms before processing MP3 request`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+    lastRequestTime = Date.now();
+    
     if (progressId) initProgress(progressId);
 
     // Check if we have cookies - if so, go straight to youtube-dl-exec
