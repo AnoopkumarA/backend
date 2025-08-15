@@ -142,16 +142,20 @@ function resolveLocalFfmpegBinary() {
 let CACHED_COOKIES_FILE = null;
 function resolveCookiesOption() {
   try {
+    console.log('Checking for cookies...');
+    
     // 1) Use browser cookies (useful for local dev only). Example: EDGE/CHROME/FIREFOX
     //    set env YTDLP_COOKIES_FROM_BROWSER=edge | chrome | firefox
     const fromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER;
     if (fromBrowser && typeof fromBrowser === 'string' && fromBrowser.trim()) {
+      console.log('Using cookies from browser:', fromBrowser);
       return { 'cookies-from-browser': fromBrowser.trim() };
     }
 
     // 2) Use an on-disk cookies.txt file (Netscape format)
     const filePath = process.env.YTDLP_COOKIES_FILE;
     if (filePath && fs.existsSync(filePath)) {
+      console.log('Using cookies from file:', filePath);
       return { cookies: filePath };
     }
 
@@ -159,24 +163,37 @@ function resolveCookiesOption() {
     const text = process.env.YTDLP_COOKIES_TEXT;
     const b64 = process.env.YTDLP_COOKIES_BASE64;
     if ((text && text.trim()) || (b64 && b64.trim())) {
+      console.log('Using cookies from env var, text length:', text ? text.length : 0, 'base64 length:', b64 ? b64.length : 0);
       if (!CACHED_COOKIES_FILE) {
         const content = text && text.trim() ? text : Buffer.from(b64, 'base64').toString('utf8');
         const target = path.join(process.cwd(), 'cookies.youtube.txt');
-        try { fs.writeFileSync(target, content, 'utf8'); } catch {}
+        try { 
+          fs.writeFileSync(target, content, 'utf8'); 
+          console.log('Wrote cookies to:', target);
+        } catch (err) {
+          console.error('Failed to write cookies file:', err.message);
+        }
         CACHED_COOKIES_FILE = target;
       }
+      console.log('Returning cookies option:', { cookies: CACHED_COOKIES_FILE });
       return { cookies: CACHED_COOKIES_FILE };
     }
-  } catch {}
+    
+    console.log('No cookies found');
+  } catch (err) {
+    console.error('Error resolving cookies:', err.message);
+  }
   return {};
 }
 
 // Simple youtube-dl-exec wrapper functions
 async function runYoutubeDl(url, options = {}) {
   try {
+    console.log('Running youtube-dl-exec with options:', JSON.stringify(options, null, 2));
     const result = await youtubedl(url, options);
     return { ok: true, result };
   } catch (error) {
+    console.error('youtube-dl-exec error:', error.message);
     return { ok: false, error: error.message || 'Unknown error' };
   }
 }
@@ -382,32 +399,50 @@ app.post('/api/download', async (req, res) => {
       return res.status(400).json({ error: 'Invalid URL' });
     }
     if (progressId) initProgress(progressId);
+
+    // Check if we have cookies - if so, go straight to youtube-dl-exec
+    const hasCookies = process.env.YTDLP_COOKIES_TEXT || process.env.YTDLP_COOKIES_BASE64 || process.env.YTDLP_COOKIES_FILE;
     
+    if (hasCookies) {
+      console.log('Cookies available, using youtube-dl-exec directly');
+      try {
+        const fallback = progressId
+          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId })
+          : await downloadWithYoutubeDl(url, { audioOnly: false });
+        return res.json(fallback);
+      } catch (fallbackErr) {
+        console.error('youtube-dl-exec failed with cookies:', fallbackErr.message);
+        if (progressId) finishProgress(progressId, false, { error: fallbackErr.message });
+        return res.status(500).json({ error: `youtube-dl-exec failed: ${fallbackErr.message}` });
+      }
+    }
+
+    // Fallback to original ytdl-core approach if no cookies
     try {
       const info = await ytdl.getInfo(url, { requestOptions: { headers: DEFAULT_HEADERS } });
-    const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, '_');
-    const id = info.videoDetails.videoId;
-    const filename = `${title}-${id}.mp4`;
-    const outDir = path.join(process.cwd(), 'downloads');
-    ensureDir(outDir);
-    const outPath = path.join(outDir, filename);
+      const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, '_');
+      const id = info.videoDetails.videoId;
+      const filename = `${title}-${id}.mp4`;
+      const outDir = path.join(process.cwd(), 'downloads');
+      ensureDir(outDir);
+      const outPath = path.join(outDir, filename);
 
-    const write = fs.createWriteStream(outPath);
-    const stream = ytdl(url, {
-      filter: 'audioandvideo',
-      quality: 'highest',
+      const write = fs.createWriteStream(outPath);
+      const stream = ytdl(url, {
+        filter: 'audioandvideo',
+        quality: 'highest',
         dlChunkSize: 0,
         highWaterMark: 1 << 26,
-      requestOptions: { headers: DEFAULT_HEADERS },
-      range: { start: 0 },
-      begin: '0s',
-    });
+        requestOptions: { headers: DEFAULT_HEADERS },
+        range: { start: 0 },
+        begin: '0s',
+      });
 
       if (progressId) {
         const startedAt = Date.now();
         stream.on('progress', (_chunkLen, downloaded, total) => {
           const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
-          const speed = downloaded / elapsed; // bytes per second
+          const speed = downloaded / elapsed;
           const remaining = Math.max(0, total - downloaded);
           const etaSeconds = speed > 0 ? Math.round(remaining / speed) : null;
           const percent = total ? (downloaded / total) * 100 : 0;
@@ -503,24 +538,44 @@ app.post('/api/download-mp3', async (req, res) => {
       return res.status(400).json({ error: 'Invalid URL' });
     }
     if (progressId) initProgress(progressId);
-    try {
-    const info = await ytdl.getInfo(url, { requestOptions: { headers: DEFAULT_HEADERS } });
-    const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, '_');
-    const id = info.videoDetails.videoId;
-    const filename = `${title}-${id}.mp3`;
-    const outDir = path.join(process.cwd(), 'downloads');
-    ensureDir(outDir);
-    const outPath = path.join(outDir, filename);
 
-    const audioStream = ytdl(url, {
-      filter: 'audioonly',
-      quality: 'highestaudio',
-      dlChunkSize: 0,
-      highWaterMark: 1 << 26,
-      requestOptions: { headers: DEFAULT_HEADERS },
-      range: { start: 0 },
-      begin: '0s',
-    });
+    // Check if we have cookies - if so, go straight to youtube-dl-exec
+    const hasCookies = process.env.YTDLP_COOKIES_TEXT || process.env.YTDLP_COOKIES_BASE64 || process.env.YTDLP_COOKIES_FILE;
+    
+    if (hasCookies) {
+      console.log('Cookies available, using youtube-dl-exec directly for MP3');
+      try {
+        const fallback = progressId
+          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId })
+          : await downloadWithYoutubeDl(url, { audioOnly: true, bitrateKbps: bitrate });
+        if (progressId) finishProgress(progressId, true, { file: fallback.filename });
+        return res.json(fallback);
+      } catch (fallbackErr) {
+        console.error('youtube-dl-exec failed with cookies for MP3:', fallbackErr.message);
+        if (progressId) finishProgress(progressId, false, { error: fallbackErr.message });
+        return res.status(500).json({ error: `youtube-dl-exec failed: ${fallbackErr.message}` });
+      }
+    }
+
+    // Fallback to original ytdl-core approach if no cookies
+    try {
+      const info = await ytdl.getInfo(url, { requestOptions: { headers: DEFAULT_HEADERS } });
+      const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, '_');
+      const id = info.videoDetails.videoId;
+      const filename = `${title}-${id}.mp3`;
+      const outDir = path.join(process.cwd(), 'downloads');
+      ensureDir(outDir);
+      const outPath = path.join(outDir, filename);
+
+      const audioStream = ytdl(url, {
+        filter: 'audioonly',
+        quality: 'highestaudio',
+        dlChunkSize: 0,
+        highWaterMark: 1 << 26,
+        requestOptions: { headers: DEFAULT_HEADERS },
+        range: { start: 0 },
+        begin: '0s',
+      });
 
       if (progressId) {
         const startedAt = Date.now();
@@ -534,11 +589,11 @@ app.post('/api/download-mp3', async (req, res) => {
         });
       }
 
-    ffmpeg(audioStream)
-      .audioCodec('libmp3lame')
-      .audioBitrate(String(bitrate))
-      .format('mp3')
-      .outputOptions(['-threads 0'])
+      ffmpeg(audioStream)
+        .audioCodec('libmp3lame')
+        .audioBitrate(String(bitrate))
+        .format('mp3')
+        .outputOptions(['-threads 0'])
         .on('error', async (err) => {
           try {
             const fallback = progressId
@@ -556,7 +611,7 @@ app.post('/api/download-mp3', async (req, res) => {
           const fileUrl = await getFileUrl(outPath, filename);
           res.json({ path: outPath, filename, url: fileUrl })
         })
-      .save(outPath);
+        .save(outPath);
     } catch (infoError) {
       try {
         const fallback = req.body?.progressId
