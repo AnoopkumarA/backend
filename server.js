@@ -137,6 +137,40 @@ function resolveLocalFfmpegBinary() {
   return null;
 }
 
+// Optional: pass YouTube cookies to yt-dlp via youtube-dl-exec
+// Supports multiple sources: browser, file path, raw text, or base64 text
+let CACHED_COOKIES_FILE = null;
+function resolveCookiesOption() {
+  try {
+    // 1) Use browser cookies (useful for local dev only). Example: EDGE/CHROME/FIREFOX
+    //    set env YTDLP_COOKIES_FROM_BROWSER=edge | chrome | firefox
+    const fromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER;
+    if (fromBrowser && typeof fromBrowser === 'string' && fromBrowser.trim()) {
+      return { 'cookies-from-browser': fromBrowser.trim() };
+    }
+
+    // 2) Use an on-disk cookies.txt file (Netscape format)
+    const filePath = process.env.YTDLP_COOKIES_FILE;
+    if (filePath && fs.existsSync(filePath)) {
+      return { cookies: filePath };
+    }
+
+    // 3) Use cookies provided directly via env var (plain text or base64)
+    const text = process.env.YTDLP_COOKIES_TEXT;
+    const b64 = process.env.YTDLP_COOKIES_BASE64;
+    if ((text && text.trim()) || (b64 && b64.trim())) {
+      if (!CACHED_COOKIES_FILE) {
+        const content = text && text.trim() ? text : Buffer.from(b64, 'base64').toString('utf8');
+        const target = path.join(process.cwd(), 'cookies.youtube.txt');
+        try { fs.writeFileSync(target, content, 'utf8'); } catch {}
+        CACHED_COOKIES_FILE = target;
+      }
+      return { cookies: CACHED_COOKIES_FILE };
+    }
+  } catch {}
+  return {};
+}
+
 // Simple youtube-dl-exec wrapper functions
 async function runYoutubeDl(url, options = {}) {
   try {
@@ -170,11 +204,18 @@ async function downloadWithYoutubeDl(url, { audioOnly = false, bitrateKbps = 192
 
   const outputTemplate = path.join(outDir, '%(title).150B-%(id)s.%(ext)s');
   
+  const cookieOpts = resolveCookiesOption();
   const options = {
     output: outputTemplate,
     noPlaylist: true,
     restrictFilenames: true,
-    print: ['after_move:filepath', 'filepath', 'filename']
+    print: ['after_move:filepath', 'filepath', 'filename'],
+    addHeader: [
+      `User-Agent: ${DEFAULT_HEADERS['User-Agent']}`,
+      'Accept-Language: en-US,en;q=0.9',
+      'Referer: https://www.youtube.com/'
+    ],
+    ...cookieOpts,
   };
 
   if (ffmpegBin) {
@@ -220,11 +261,18 @@ async function downloadWithYoutubeDlStreaming(url, { audioOnly = false, bitrateK
 
   const outputTemplate = path.join(outDir, '%(title).150B-%(id)s.%(ext)s');
   
+  const cookieOpts = resolveCookiesOption();
   const options = {
     output: outputTemplate,
     noPlaylist: true,
     restrictFilenames: true,
-    print: ['after_move:filepath', 'filepath', 'filename']
+    print: ['after_move:filepath', 'filepath', 'filename'],
+    addHeader: [
+      `User-Agent: ${DEFAULT_HEADERS['User-Agent']}`,
+      'Accept-Language: en-US,en;q=0.9',
+      'Referer: https://www.youtube.com/'
+    ],
+    ...cookieOpts,
   };
 
   if (ffmpegBin) {
