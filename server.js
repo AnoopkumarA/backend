@@ -5,7 +5,7 @@ const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
 const ffmpegPath = require('ffmpeg-static');
 const ffmpeg = require('fluent-ffmpeg');
-const { spawn } = require('child_process');
+const youtubedl = require('youtube-dl-exec');
 
 // S3 configuration (optional - falls back to local storage if not configured)
 const S3_CONFIG = {
@@ -137,41 +137,14 @@ function resolveLocalFfmpegBinary() {
   return null;
 }
 
-function spawnOnce(command, args, options) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, options);
-    let stdout = '';
-    let stderr = '';
-    let spawned = true;
-    child.on('error', (err) => {
-      spawned = false;
-      resolve({ ok: false, code: null, error: err, stdout: '', stderr: '' });
-    });
-    child.stdout && child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr && child.stderr.on('data', (d) => { stderr += d.toString(); });
-    child.on('close', (code) => {
-      if (!spawned) return; 
-      resolve({ ok: code === 0, code, error: null, stdout, stderr });
-    });
-  });
-}
-
-async function runYtDlp(url, args) {
-  const commands = [
-    { cmd: 'yt-dlp', args: [] },
-    { cmd: 'python', args: ['-m', 'yt_dlp'] },
-    { cmd: 'python3', args: ['-m', 'yt_dlp'] },
-    { cmd: 'py', args: ['-3', '-m', 'yt_dlp'] },
-  ];
-  for (const candidate of commands) {
-    const result = await spawnOnce(candidate.cmd, [...candidate.args, ...args, url], { shell: false });
-    if (result.ok) return result;
-    const isNotFound = result.error && (result.error.code === 'ENOENT');
-    if (!isNotFound && result.code !== null) {
-      return result;
-    }
+// Simple youtube-dl-exec wrapper functions
+async function runYoutubeDl(url, options = {}) {
+  try {
+    const result = await youtubedl(url, options);
+    return { ok: true, result };
+  } catch (error) {
+    return { ok: false, error: error.message || 'Unknown error' };
   }
-  return { ok: false, code: null, error: new Error('yt-dlp not available'), stdout: '', stderr: '' };
 }
 
 function getNewestFileInDirectory(directoryPath, extensions, newerThanMs) {
@@ -189,130 +162,129 @@ function getNewestFileInDirectory(directoryPath, extensions, newerThanMs) {
   return filtered[0] || null;
 }
 
-async function downloadWithYtDlp(url, { audioOnly = false, bitrateKbps = 192 } = {}) {
+async function downloadWithYoutubeDl(url, { audioOnly = false, bitrateKbps = 192 } = {}) {
   const outDir = path.join(process.cwd(), 'downloads');
   ensureDir(outDir);
   const ffmpegBin = resolveLocalFfmpegBinary();
   const startMs = Date.now();
 
   const outputTemplate = path.join(outDir, '%(title).150B-%(id)s.%(ext)s');
-  const baseArgs = [
-    '--no-playlist',
-    '--restrict-filenames',
-    '-o', outputTemplate,
-    '--print', 'after_move:filepath',
-    '--print', 'filepath',
-    '--print', 'filename'
-  ];
+  
+  const options = {
+    output: outputTemplate,
+    noPlaylist: true,
+    restrictFilenames: true,
+    print: ['after_move:filepath', 'filepath', 'filename']
+  };
+
   if (ffmpegBin) {
-    baseArgs.push('--ffmpeg-location', ffmpegBin);
+    options.ffmpegLocation = ffmpegBin;
   }
-  const modeArgs = audioOnly
-    ? ['-f', 'bestaudio/best', '--extract-audio', '--audio-format', 'mp3', '--audio-quality', String(bitrateKbps)]
-    : ['-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'];
 
-  const result = await runYtDlp(url, [...modeArgs, ...baseArgs]);
+  if (audioOnly) {
+    options.extractAudio = true;
+    options.audioFormat = 'mp3';
+    options.audioQuality = String(bitrateKbps);
+    options.format = 'bestaudio/best';
+  } else {
+    options.format = 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b';
+  }
+
+  const result = await runYoutubeDl(url, options);
   if (!result.ok) {
-    const message = result.stderr || (result.error ? result.error.message : 'Unknown error');
-    throw new Error(`yt-dlp failed: ${message}`);
+    throw new Error(`youtube-dl-exec failed: ${result.error}`);
   }
 
-  const lines = (result.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  let resolvedPath = lines.reverse().find((l) => l.toLowerCase().startsWith(outDir.toLowerCase()));
-  if (!resolvedPath) {
-    const extList = audioOnly ? ['.mp3'] : ['.mp4'];
-    const newest = getNewestFileInDirectory(outDir, extList, startMs - 1000);
-    if (newest) resolvedPath = newest;
-  }
-  if (!resolvedPath || !fs.existsSync(resolvedPath)) {
-    throw new Error('yt-dlp finished but output file could not be determined');
+  // Find the downloaded file
+  const extList = audioOnly ? ['.mp3'] : ['.mp4'];
+  const newest = getNewestFileInDirectory(outDir, extList, startMs - 1000);
+  if (!newest || !fs.existsSync(newest)) {
+    throw new Error('youtube-dl-exec finished but output file could not be determined');
   }
   
-  const filename = path.basename(resolvedPath);
-  const fileUrl = await getFileUrl(resolvedPath, filename);
+  const filename = path.basename(newest);
+  const fileUrl = await getFileUrl(newest, filename);
   
   return {
-    path: resolvedPath,
+    path: newest,
     filename,
     url: fileUrl,
   };
 }
 
-async function downloadWithYtDlpStreaming(url, { audioOnly = false, bitrateKbps = 192, progressId } = {}) {
+async function downloadWithYoutubeDlStreaming(url, { audioOnly = false, bitrateKbps = 192, progressId } = {}) {
   const outDir = path.join(process.cwd(), 'downloads');
   ensureDir(outDir);
   const ffmpegBin = resolveLocalFfmpegBinary();
+  const startMs = Date.now();
+
   const outputTemplate = path.join(outDir, '%(title).150B-%(id)s.%(ext)s');
-  const baseArgs = [
-    '--no-playlist',
-    '--restrict-filenames',
-    '-o', outputTemplate,
-    '--print', 'after_move:filepath',
-    '--print', 'filepath',
-    '--print', 'filename'
-  ];
-  if (ffmpegBin) baseArgs.push('--ffmpeg-location', ffmpegBin);
-  const modeArgs = audioOnly
-    ? ['-f', 'bestaudio/best', '--extract-audio', '--audio-format', 'mp3', '--audio-quality', String(bitrateKbps)]
-    : ['-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'];
+  
+  const options = {
+    output: outputTemplate,
+    noPlaylist: true,
+    restrictFilenames: true,
+    print: ['after_move:filepath', 'filepath', 'filename']
+  };
 
-  const commands = [
-    { cmd: 'yt-dlp', args: [] },
-    { cmd: 'python', args: ['-m', 'yt_dlp'] },
-    { cmd: 'python3', args: ['-m', 'yt_dlp'] },
-    { cmd: 'py', args: ['-3', '-m', 'yt_dlp'] },
-  ];
+  if (ffmpegBin) {
+    options.ffmpegLocation = ffmpegBin;
+  }
 
-  let stdout = '';
-  let selected = null;
-  for (const candidate of commands) {
-    const child = spawn(candidate.cmd, [...candidate.args, ...modeArgs, ...baseArgs, url], { shell: false });
-    selected = child;
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => {
-      const text = d.toString();
-      // Parse lines like: "[download]  42.1% of 10.00MiB at 2.00MiB/s ETA 00:03"
-      const m = text.match(/(\d{1,3}\.\d|\d{1,3})%.*?ETA\s+(\d{2}):(\d{2})/);
-      if (m && progressId) {
-        const percent = Math.max(0, Math.min(100, parseFloat(m[1])));
-        const etaSeconds = parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
-        setProgress(progressId, { status: 'downloading', percent, etaSeconds });
-      } else if (progressId) {
-        setProgress(progressId, { status: 'downloading' });
+  if (audioOnly) {
+    options.extractAudio = true;
+    options.audioFormat = 'mp3';
+    options.audioQuality = String(bitrateKbps);
+    options.format = 'bestaudio/best';
+  } else {
+    options.format = 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b';
+  }
+
+  // For streaming version, we'll use the same approach but with progress updates
+  // Note: youtube-dl-exec doesn't support real-time progress like the old spawn approach
+  // So we'll simulate progress updates
+  if (progressId) {
+    setProgress(progressId, { status: 'downloading', percent: 0, etaSeconds: null });
+    
+    // Simulate progress updates every 2 seconds
+    const progressInterval = setInterval(() => {
+      const current = progressStates.get(progressId);
+      if (current && current.status === 'downloading') {
+        const elapsed = (Date.now() - current.startedAt) / 1000;
+        // Estimate progress based on time (this is a fallback since we can't get real progress)
+        const estimatedPercent = Math.min(90, Math.floor(elapsed / 30 * 100)); // Assume 30 seconds for most videos
+        setProgress(progressId, { percent: estimatedPercent });
       }
-    });
-    const res = await new Promise((resolve) => {
-      child.on('close', (code) => resolve({ ok: code === 0, code }));
-      child.on('error', (err) => resolve({ ok: false, error: err }));
-    });
-    if (res.ok) {
-      break;
-    }
-    // If the command was not found, try the next candidate
-    if (res.error && res.error.code === 'ENOENT') {
-      selected = null;
-      continue;
-    }
-    // Any other error: stop trying further and throw
-    selected = null;
-    throw res.error || new Error('yt-dlp failed');
+    }, 2000);
+
+    // Clear interval after 3 minutes or when done
+    setTimeout(() => clearInterval(progressInterval), 180000);
   }
 
-  if (!selected) throw new Error('yt-dlp not available or failed');
+  const result = await runYoutubeDl(url, options);
+  if (!result.ok) {
+    if (progressId) finishProgress(progressId, false, { error: result.error });
+    throw new Error(`youtube-dl-exec failed: ${result.error}`);
+  }
 
-  const lines = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  let resolvedPath = lines.reverse().find((l) => l.toLowerCase().startsWith(path.join(process.cwd(), 'downloads').toLowerCase()));
-  if (!resolvedPath || !fs.existsSync(resolvedPath)) {
-    // Best-effort: pick newest file
-    const extList = audioOnly ? ['.mp3'] : ['.mp4'];
-    const newest = getNewestFileInDirectory(path.join(process.cwd(), 'downloads'), extList);
-    resolvedPath = newest;
+  // Find the downloaded file
+  const extList = audioOnly ? ['.mp3'] : ['.mp4'];
+  const newest = getNewestFileInDirectory(outDir, extList, startMs - 1000);
+  if (!newest || !fs.existsSync(newest)) {
+    if (progressId) finishProgress(progressId, false, { error: 'Output file not found' });
+    throw new Error('youtube-dl-exec finished but output file could not be determined');
   }
-  if (!resolvedPath || !fs.existsSync(resolvedPath)) {
-    throw new Error('yt-dlp finished but output file could not be determined');
-  }
-  if (progressId) finishProgress(progressId, true);
-  return { path: resolvedPath, filename: path.basename(resolvedPath), url: `/downloads/${encodeURIComponent(path.basename(resolvedPath))}` };
+
+  if (progressId) finishProgress(progressId, true, { file: path.basename(newest) });
+  
+  const filename = path.basename(newest);
+  const fileUrl = await getFileUrl(newest, filename);
+  
+  return {
+    path: newest,
+    filename,
+    url: fileUrl,
+  };
 }
 
 // Helper function to upload file to S3 or return local path
@@ -407,12 +379,12 @@ app.post('/api/download', async (req, res) => {
         console.log('Stream error, trying yt-dlp fallback:', err.message);
         try {
           const fallback = progressId
-            ? await downloadWithYtDlpStreaming(url, { audioOnly: false, progressId })
-            : await downloadWithYtDlp(url, { audioOnly: false });
+            ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId })
+            : await downloadWithYoutubeDl(url, { audioOnly: false });
           finalize(200, fallback);
         } catch (fallbackErr) {
           if (progressId) finishProgress(progressId, false);
-          finalize(500, { error: `Download failed: ${err.message}; yt-dlp fallback failed: ${fallbackErr.message}` });
+          finalize(500, { error: `Download failed: ${err.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
         }
       });
 
@@ -426,12 +398,12 @@ app.post('/api/download', async (req, res) => {
         if (responded) return;
         try {
           const fallback = progressId
-            ? await downloadWithYtDlpStreaming(url, { audioOnly: false, progressId })
-            : await downloadWithYtDlp(url, { audioOnly: false });
+            ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId })
+            : await downloadWithYoutubeDl(url, { audioOnly: false });
           finalize(200, fallback);
         } catch (fallbackErr) {
           if (progressId) finishProgress(progressId, false, { error: err.message });
-          finalize(500, { error: `File write failed: ${err.message}; yt-dlp fallback failed: ${fallbackErr.message}` });
+          finalize(500, { error: `File write failed: ${err.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
         }
       });
 
@@ -440,13 +412,13 @@ app.post('/api/download', async (req, res) => {
       console.log('ytdl-core failed, trying yt-dlp fallback:', infoError.message);
       try {
         const fallback = req.body?.progressId
-          ? await downloadWithYtDlpStreaming(url, { audioOnly: false, progressId: req.body.progressId })
-          : await downloadWithYtDlp(url, { audioOnly: false });
+          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId: req.body.progressId })
+          : await downloadWithYoutubeDl(url, { audioOnly: false });
         return res.json(fallback);
       } catch (fallbackErr) {
-        console.error('Both ytdl-core and yt-dlp failed:', infoError.message, fallbackErr.message);
+        console.error('Both ytdl-core and youtube-dl-exec failed:', infoError.message, fallbackErr.message);
         if (req.body?.progressId) finishProgress(req.body.progressId, false, { error: infoError.message });
-        return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; yt-dlp fallback failed: ${fallbackErr.message}` });
+        return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
       }
     }
   } catch (e) {
@@ -522,8 +494,8 @@ app.post('/api/download-mp3', async (req, res) => {
         .on('error', async (err) => {
           try {
             const fallback = progressId
-              ? await downloadWithYtDlpStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId })
-              : await downloadWithYtDlp(url, { audioOnly: true, bitrateKbps: bitrate });
+              ? await downloadWithYoutubeDlStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId })
+              : await downloadWithYoutubeDl(url, { audioOnly: true, bitrateKbps: bitrate });
             if (progressId) finishProgress(progressId, true, { file: filename });
             res.json(fallback);
           } catch (fallbackErr) {
@@ -540,13 +512,13 @@ app.post('/api/download-mp3', async (req, res) => {
     } catch (infoError) {
       try {
         const fallback = req.body?.progressId
-          ? await downloadWithYtDlpStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId: req.body.progressId })
-          : await downloadWithYtDlp(url, { audioOnly: true, bitrateKbps: bitrate });
+          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId: req.body.progressId })
+          : await downloadWithYoutubeDl(url, { audioOnly: true, bitrateKbps: bitrate });
         if (req.body?.progressId) finishProgress(req.body.progressId, true);
         return res.json(fallback);
       } catch (fallbackErr) {
         if (req.body?.progressId) finishProgress(req.body.progressId, false);
-        return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; yt-dlp fallback failed: ${fallbackErr.message}` });
+        return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
       }
     }
   } catch (e) {
