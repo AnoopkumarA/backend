@@ -8,7 +8,7 @@
     "api": "node server.js",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "node app.js",
+    "start": "node server.js",
     "download": "node app.js --url",
     "convert": "node app.js --convert"
   },
@@ -16,6 +16,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
     "@distube/ytdl-core": "^4.16.12",
     "@tailwindcss/postcss": "^4.1.11",
     "chalk": "^4.1.2",
@@ -27,7 +28,7 @@
     "ora": "^5.4.1",
     "postcss": "^8.5.6",
     "react-router-dom": "^7.8.0",
-    "@aws-sdk/client-s3": "^3.0.0"
+    "youtube-dl-exec": "^3.0.24"
   },
   "bin": {
     "ytvideo": "app.js"
