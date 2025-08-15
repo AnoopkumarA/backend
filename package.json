@@ -9,6 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server.js",
+    "railway-start": "node server.js",
     "download": "node app.js --url",
     "convert": "node app.js --convert"
   },
