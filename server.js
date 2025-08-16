@@ -5,40 +5,14 @@ const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
 const ffmpegPath = require('ffmpeg-static');
 const ffmpeg = require('fluent-ffmpeg');
-const youtubedl = require('youtube-dl-exec');
 
-// S3 configuration (optional - falls back to local storage if not configured)
-const S3_CONFIG = {
-  enabled: process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.AWS_S3_BUCKET,
-  bucket: process.env.AWS_S3_BUCKET,
-  region: process.env.AWS_REGION || 'us-east-1',
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-};
-
-// Initialize S3 client if configured
-let s3Client = null;
-if (S3_CONFIG.enabled) {
-  try {
-    const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-    s3Client = new S3Client({
-      region: S3_CONFIG.region,
-      credentials: {
-        accessKeyId: S3_CONFIG.accessKeyId,
-        secretAccessKey: S3_CONFIG.secretAccessKey,
-      },
-    });
-  } catch (err) {
-    console.warn('S3 client not available, falling back to local storage:', err.message);
-    S3_CONFIG.enabled = false;
-  }
-}
+// Local storage only - simplified for Railway deployment
 
 if (ffmpegPath) {
   ffmpeg.setFfmpegPath(ffmpegPath);
 }
 
-// Ensure downloads directory exists at startup (important for Render/local storage)
+// Ensure downloads directory exists at startup (important for Railway/local storage)
 try {
   const downloadsDir = path.join(process.cwd(), 'downloads');
   if (!fs.existsSync(downloadsDir)) {
@@ -67,16 +41,19 @@ try {
     }
   }
 } catch {}
+
 function initProgress(id) {
   if (!id) return;
   progressStates.set(id, { status: 'starting', percent: 0, etaSeconds: null, startedAt: Date.now() });
 }
+
 function setProgress(id, mutation) {
   if (!id) return;
   const prev = progressStates.get(id) || { status: 'starting', percent: 0, etaSeconds: null, startedAt: Date.now() };
   const next = { ...prev, ...mutation };
   progressStates.set(id, next);
 }
+
 function finishProgress(id, ok, details) {
   if (!id) return;
   const now = Date.now();
@@ -98,315 +75,31 @@ app.get('/api/progress/:id', (req, res) => {
       res.write(`data: ${JSON.stringify(state)}\n\n`);
     } catch (_) {
       clearInterval(timer);
-    }
-    if (state.status === 'done' || state.status === 'error') {
-      clearInterval(timer);
+      return;
     }
   };
+
+  send(); // Send initial state
   const timer = setInterval(send, 1000);
-  send();
-  req.on('close', () => { clearInterval(timer); });
-});
 
-// JSON polling fallback for environments that don't support SSE
-app.get('/api/progress/:id/json', (req, res) => {
-  const { id } = req.params;
-  const state = progressStates.get(id) || { status: 'unknown' };
-  res.setHeader('Cache-Control', 'no-store');
-  res.json(state);
-});
-
-const DEFAULT_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'DNT': '1',
-  'Connection': 'keep-alive',
-  'Upgrade-Insecure-Requests': '1',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Cache-Control': 'max-age=0',
-  'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Windows"'
-};
-
-function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
-
-function resolveLocalFfmpegBinary() {
-  try {
-    const candidate = path.join(process.cwd(), 'tools', 'ffmpeg-7.1.1-essentials_build', 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
-    if (fs.existsSync(candidate)) return candidate;
-  } catch (_) {}
-  if (ffmpegPath) return ffmpegPath;
-  return null;
-}
-
-// Optional: pass YouTube cookies to yt-dlp via youtube-dl-exec
-// Supports multiple sources: browser, file path, raw text, or base64 text
-let CACHED_COOKIES_FILE = null;
-function resolveCookiesOption() {
-  try {
-    console.log('Checking for cookies...');
-    
-    // 1) Use browser cookies (useful for local dev only). Example: EDGE/CHROME/FIREFOX
-    //    set env YTDLP_COOKIES_FROM_BROWSER=edge | chrome | firefox
-    const fromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER;
-    if (fromBrowser && typeof fromBrowser === 'string' && fromBrowser.trim()) {
-      console.log('Using cookies from browser:', fromBrowser);
-      return { 'cookies-from-browser': fromBrowser.trim() };
-    }
-
-    // 2) Use an on-disk cookies.txt file (Netscape format)
-    const filePath = process.env.YTDLP_COOKIES_FILE;
-    if (filePath && fs.existsSync(filePath)) {
-      console.log('Using cookies from file:', filePath);
-      return { cookies: filePath };
-    }
-
-    // 3) Use cookies provided directly via env var (plain text or base64)
-    const text = process.env.YTDLP_COOKIES_TEXT;
-    const b64 = process.env.YTDLP_COOKIES_BASE64;
-    if ((text && text.trim()) || (b64 && b64.trim())) {
-      console.log('Using cookies from env var, text length:', text ? text.length : 0, 'base64 length:', b64 ? b64.length : 0);
-      if (!CACHED_COOKIES_FILE) {
-        const content = text && text.trim() ? text : Buffer.from(b64, 'base64').toString('utf8');
-        const target = path.join(process.cwd(), 'cookies.youtube.txt');
-        try { 
-          fs.writeFileSync(target, content, 'utf8'); 
-          console.log('Wrote cookies to:', target);
-        } catch (err) {
-          console.error('Failed to write cookies file:', err.message);
-        }
-        CACHED_COOKIES_FILE = target;
-      }
-      console.log('Returning cookies option:', { cookies: CACHED_COOKIES_FILE });
-      return { cookies: CACHED_COOKIES_FILE };
-    }
-    
-    console.log('No cookies found');
-  } catch (err) {
-    console.error('Error resolving cookies:', err.message);
-  }
-  return {};
-}
-
-// Simple youtube-dl-exec wrapper functions
-async function runYoutubeDl(url, options = {}) {
-  try {
-    console.log('Running youtube-dl-exec with options:', JSON.stringify(options, null, 2));
-    const result = await youtubedl(url, options);
-    return { ok: true, result };
-  } catch (error) {
-    console.error('youtube-dl-exec error:', error.message);
-    return { ok: false, error: error.message || 'Unknown error' };
-  }
-}
-
-function getNewestFileInDirectory(directoryPath, extensions, newerThanMs) {
-  const entries = fs.readdirSync(directoryPath).map((name) => path.join(directoryPath, name));
-  const filtered = entries.filter((p) => {
-    try {
-      const stat = fs.statSync(p);
-      const ext = path.extname(p).toLowerCase();
-      return stat.isFile() && (!extensions || extensions.includes(ext)) && (!newerThanMs || stat.mtimeMs >= newerThanMs);
-    } catch (_) {
-      return false;
-    }
+  req.on('close', () => {
+    clearInterval(timer);
   });
-  filtered.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-  return filtered[0] || null;
+});
+
+// Helper function to get local file URL
+function getFileUrl(filename) {
+  return `/downloads/${filename}`;
 }
 
-async function downloadWithYoutubeDl(url, { audioOnly = false, bitrateKbps = 192 } = {}) {
-  const outDir = path.join(process.cwd(), 'downloads');
-  ensureDir(outDir);
-  const ffmpegBin = resolveLocalFfmpegBinary();
-  const startMs = Date.now();
-
-  const outputTemplate = path.join(outDir, '%(title).150B-%(id)s.%(ext)s');
-  
-  const cookieOpts = resolveCookiesOption();
-  const options = {
-    output: outputTemplate,
-    noPlaylist: true,
-    restrictFilenames: true,
-    print: ['after_move:filepath', 'filepath', 'filename'],
-    addHeader: [
-      `User-Agent: ${DEFAULT_HEADERS['User-Agent']}`,
-      'Accept-Language: en-US,en;q=0.9',
-      'Referer: https://www.youtube.com/'
-    ],
-    ...cookieOpts,
-  };
-
-  if (ffmpegBin) {
-    options.ffmpegLocation = ffmpegBin;
-  }
-
-  if (audioOnly) {
-    options.extractAudio = true;
-    options.audioFormat = 'mp3';
-    options.audioQuality = String(bitrateKbps);
-    options.format = 'bestaudio/best';
-  } else {
-    options.format = 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b';
-  }
-
-  const result = await runYoutubeDl(url, options);
-  if (!result.ok) {
-    throw new Error(`youtube-dl-exec failed: ${result.error}`);
-  }
-
-  // Find the downloaded file
-  const extList = audioOnly ? ['.mp3'] : ['.mp4'];
-  const newest = getNewestFileInDirectory(outDir, extList, startMs - 1000);
-  if (!newest || !fs.existsSync(newest)) {
-    throw new Error('youtube-dl-exec finished but output file could not be determined');
-  }
-  
-  const filename = path.basename(newest);
-  const fileUrl = await getFileUrl(newest, filename);
-  
-  return {
-    path: newest,
-    filename,
-    url: fileUrl,
-  };
-}
-
-async function downloadWithYoutubeDlStreaming(url, { audioOnly = false, bitrateKbps = 192, progressId } = {}) {
-  const outDir = path.join(process.cwd(), 'downloads');
-  ensureDir(outDir);
-  const ffmpegBin = resolveLocalFfmpegBinary();
-  const startMs = Date.now();
-
-  const outputTemplate = path.join(outDir, '%(title).150B-%(id)s.%(ext)s');
-  
-  const cookieOpts = resolveCookiesOption();
-  const options = {
-    output: outputTemplate,
-    noPlaylist: true,
-    restrictFilenames: true,
-    print: ['after_move:filepath', 'filepath', 'filename'],
-    addHeader: [
-      `User-Agent: ${DEFAULT_HEADERS['User-Agent']}`,
-      'Accept-Language: en-US,en;q=0.9',
-      'Referer: https://www.youtube.com/'
-    ],
-    ...cookieOpts,
-  };
-
-  if (ffmpegBin) {
-    options.ffmpegLocation = ffmpegBin;
-  }
-
-  if (audioOnly) {
-    options.extractAudio = true;
-    options.audioFormat = 'mp3';
-    options.audioQuality = String(bitrateKbps);
-    options.format = 'bestaudio/best';
-  } else {
-    options.format = 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b';
-  }
-
-  // For streaming version, we'll use the same approach but with progress updates
-  // Note: youtube-dl-exec doesn't support real-time progress like the old spawn approach
-  // So we'll simulate progress updates
-  if (progressId) {
-    setProgress(progressId, { status: 'downloading', percent: 0, etaSeconds: null });
-    
-    // Simulate progress updates every 2 seconds
-    const progressInterval = setInterval(() => {
-      const current = progressStates.get(progressId);
-      if (current && current.status === 'downloading') {
-        const elapsed = (Date.now() - current.startedAt) / 1000;
-        // Estimate progress based on time (this is a fallback since we can't get real progress)
-        const estimatedPercent = Math.min(90, Math.floor(elapsed / 30 * 100)); // Assume 30 seconds for most videos
-        setProgress(progressId, { percent: estimatedPercent });
-      }
-    }, 2000);
-
-    // Clear interval after 3 minutes or when done
-    setTimeout(() => clearInterval(progressInterval), 180000);
-  }
-
-  const result = await runYoutubeDl(url, options);
-  if (!result.ok) {
-    if (progressId) finishProgress(progressId, false, { error: result.error });
-    throw new Error(`youtube-dl-exec failed: ${result.error}`);
-  }
-
-  // Find the downloaded file
-  const extList = audioOnly ? ['.mp3'] : ['.mp4'];
-  const newest = getNewestFileInDirectory(outDir, extList, startMs - 1000);
-  if (!newest || !fs.existsSync(newest)) {
-    if (progressId) finishProgress(progressId, false, { error: 'Output file not found' });
-    throw new Error('youtube-dl-exec finished but output file could not be determined');
-  }
-
-  if (progressId) finishProgress(progressId, true, { file: path.basename(newest) });
-  
-  const filename = path.basename(newest);
-  const fileUrl = await getFileUrl(newest, filename);
-  
-  return {
-    path: newest,
-    filename,
-    url: fileUrl,
-  };
-}
-
-// Helper function to upload file to S3 or return local path
-async function getFileUrl(filePath, filename) {
-  if (!S3_CONFIG.enabled || !s3Client) {
-    // Fallback to local storage
-    return `/downloads/${encodeURIComponent(filename)}`;
-  }
-
-  try {
-    const fileStream = fs.createReadStream(filePath);
-    const { PutObjectCommand } = require('@aws-sdk/client-s3');
-    
-    const uploadParams = {
-      Bucket: S3_CONFIG.bucket,
-      Key: `downloads/${filename}`,
-      Body: fileStream,
-      ContentType: filename.endsWith('.mp4') ? 'video/mp4' : 'audio/mpeg',
-      ACL: 'public-read',
-    };
-
-    await s3Client.send(new PutObjectCommand(uploadParams));
-    
-    // Return S3 public URL
-    const s3Url = `https://${S3_CONFIG.bucket}.s3.${S3_CONFIG.region}.amazonaws.com/downloads/${encodeURIComponent(filename)}`;
-    
-    // Optionally delete local file after S3 upload
-    if (process.env.CLEANUP_LOCAL_FILES === 'true') {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (err) {
-        console.warn('Failed to cleanup local file:', err.message);
-      }
-    }
-    
-    return s3Url;
-  } catch (err) {
-    console.error('S3 upload failed, falling back to local:', err.message);
-    return `/downloads/${encodeURIComponent(filename)}`;
-  }
-}
-
+// Download video endpoint
 app.post('/api/download', async (req, res) => {
   try {
     const { url, progressId } = req.body || {};
     if (!url || !ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid URL' });
     }
-    
+
     // Rate limiting: ensure minimum time between requests
     const now = Date.now();
     const timeSinceLastRequest = now - lastRequestTime;
@@ -416,250 +109,219 @@ app.post('/api/download', async (req, res) => {
       await new Promise(resolve => setTimeout(resolve, waitTime));
     }
     lastRequestTime = Date.now();
-    
+
     if (progressId) initProgress(progressId);
 
-    // Check if we have cookies - if so, go straight to youtube-dl-exec
-    const hasCookies = process.env.YTDLP_COOKIES_TEXT || process.env.YTDLP_COOKIES_BASE64 || process.env.YTDLP_COOKIES_FILE;
+    console.log('Getting video info...');
+    setProgress(progressId, { status: 'getting_info', percent: 10 });
+
+    const info = await ytdl.getInfo(url);
+    const videoTitle = info.videoDetails.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_');
+    const filename = `${videoTitle}-${Date.now()}.mp4`;
+    const filepath = path.join(process.cwd(), 'downloads', filename);
+
+    setProgress(progressId, { status: 'downloading', percent: 20 });
+
+    console.log('Starting download...');
+    const stream = ytdl(url, { 
+      quality: 'highest',
+      filter: 'audioandvideo'
+    });
+
+    const writeStream = fs.createWriteStream(filepath);
     
-    if (hasCookies) {
-      console.log('Cookies available, using youtube-dl-exec directly');
-      try {
-        const fallback = progressId
-          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId })
-          : await downloadWithYoutubeDl(url, { audioOnly: false });
-        return res.json(fallback);
-      } catch (fallbackErr) {
-        console.error('youtube-dl-exec failed with cookies:', fallbackErr.message);
-        if (progressId) finishProgress(progressId, false, { error: fallbackErr.message });
-        return res.status(500).json({ error: `youtube-dl-exec failed: ${fallbackErr.message}` });
-      }
-    }
-
-    // Fallback to original ytdl-core approach if no cookies
-    try {
-      const info = await ytdl.getInfo(url, { requestOptions: { headers: DEFAULT_HEADERS } });
-      const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, '_');
-      const id = info.videoDetails.videoId;
-      const filename = `${title}-${id}.mp4`;
-      const outDir = path.join(process.cwd(), 'downloads');
-      ensureDir(outDir);
-      const outPath = path.join(outDir, filename);
-
-      const write = fs.createWriteStream(outPath);
-      const stream = ytdl(url, {
-        filter: 'audioandvideo',
-        quality: 'highest',
-        dlChunkSize: 0,
-        highWaterMark: 1 << 26,
-        requestOptions: { headers: DEFAULT_HEADERS },
-        range: { start: 0 },
-        begin: '0s',
-      });
-
-      if (progressId) {
-        const startedAt = Date.now();
-        stream.on('progress', (_chunkLen, downloaded, total) => {
-          const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
-          const speed = downloaded / elapsed;
-          const remaining = Math.max(0, total - downloaded);
-          const etaSeconds = speed > 0 ? Math.round(remaining / speed) : null;
-          const percent = total ? (downloaded / total) * 100 : 0;
-          setProgress(progressId, { status: 'downloading', percent, etaSeconds });
+    let downloadedBytes = 0;
+    const totalBytes = parseInt(info.formats.find(f => f.quality === 'highest')?.contentLength || '0');
+    
+    stream.on('data', (chunk) => {
+      downloadedBytes += chunk.length;
+      if (totalBytes > 0) {
+        const percent = Math.min(90, 20 + (downloadedBytes / totalBytes) * 70);
+        setProgress(progressId, { 
+          status: 'downloading', 
+          percent: Math.round(percent),
+          etaSeconds: totalBytes > 0 ? Math.round((totalBytes - downloadedBytes) / (downloadedBytes / (Date.now() - (progressStates.get(progressId)?.startedAt || Date.now()))) / 1000) : null
         });
       }
+    });
 
-      let responded = false;
-      const finalize = (statusCode, payload) => {
-        if (responded) return;
-        responded = true;
-        res.status(statusCode).json(payload);
-      };
-
-      stream.on('error', async (err) => {
-        if (responded) return;
-        console.log('Stream error, trying yt-dlp fallback:', err.message);
-        try {
-          const fallback = progressId
-            ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId })
-            : await downloadWithYoutubeDl(url, { audioOnly: false });
-          finalize(200, fallback);
-        } catch (fallbackErr) {
-          if (progressId) finishProgress(progressId, false);
-          finalize(500, { error: `Download failed: ${err.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
-        }
-      });
-
-      write.on('finish', async () => {
-        if (progressId) finishProgress(progressId, true, { file: filename });
-        const fileUrl = await getFileUrl(outPath, filename);
-        finalize(200, { path: outPath, filename, url: fileUrl });
-      });
-
-      write.on('error', async (err) => {
-        if (responded) return;
-        try {
-          const fallback = progressId
-            ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId })
-            : await downloadWithYoutubeDl(url, { audioOnly: false });
-          finalize(200, fallback);
-        } catch (fallbackErr) {
-          if (progressId) finishProgress(progressId, false, { error: err.message });
-          finalize(500, { error: `File write failed: ${err.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
-        }
-      });
-
-      stream.pipe(write);
-    } catch (infoError) {
-      console.log('ytdl-core failed, trying yt-dlp fallback:', infoError.message);
+    stream.on('end', async () => {
+      console.log('Download completed');
+      setProgress(progressId, { status: 'processing', percent: 95 });
+      
       try {
-        const fallback = req.body?.progressId
-          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: false, progressId: req.body.progressId })
-          : await downloadWithYoutubeDl(url, { audioOnly: false });
-        return res.json(fallback);
-      } catch (fallbackErr) {
-        console.error('Both ytdl-core and youtube-dl-exec failed:', infoError.message, fallbackErr.message);
-        if (req.body?.progressId) finishProgress(req.body.progressId, false, { error: infoError.message });
-        return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
+        // Get the final URL
+        const finalUrl = getFileUrl(filename);
+        
+        finishProgress(progressId, true, { file: filename });
+        
+        res.json({
+          success: true,
+          filename,
+          url: finalUrl,
+          message: 'Video downloaded successfully'
+        });
+      } catch (err) {
+        console.error('Post-download processing failed:', err.message);
+        finishProgress(progressId, false, { error: err.message });
+        res.status(500).json({ error: `Post-download processing failed: ${err.message}` });
       }
-    }
-  } catch (e) {
-    console.error('General error:', e.message);
-    res.status(500).json({ error: e.message });
+    });
+
+    stream.on('error', (err) => {
+      console.error('Download stream error:', err.message);
+      finishProgress(progressId, false, { error: err.message });
+      res.status(500).json({ error: `Download failed: ${err.message}` });
+    });
+
+    writeStream.on('error', (err) => {
+      console.error('File write error:', err.message);
+      finishProgress(progressId, false, { error: err.message });
+      res.status(500).json({ error: `File write failed: ${err.message}` });
+    });
+
+    stream.pipe(writeStream);
+
+  } catch (err) {
+    console.error('Download endpoint error:', err.message);
+    if (progressId) finishProgress(progressId, false, { error: err.message });
+    res.status(500).json({ error: `Download failed: ${err.message}` });
   }
 });
 
-app.post('/api/convert', async (req, res) => {
-  try {
-    const { file, bitrate = 192 } = req.body || {};
-    if (!file || !fs.existsSync(file)) {
-      return res.status(400).json({ error: 'File not found' });
-    }
-    const { name, dir } = path.parse(file);
-    const outPath = path.join(dir, `${name}.mp3`);
-
-    ffmpeg(file)
-      .audioCodec('libmp3lame')
-      .audioBitrate(String(bitrate))
-      .noVideo()
-      .on('end', () => res.json({ path: outPath, filename: path.basename(outPath) }))
-      .on('error', (err) => res.status(500).json({ error: err.message }))
-      .save(outPath);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
+// Download MP3 endpoint
 app.post('/api/download-mp3', async (req, res) => {
   try {
-    const { url, bitrate = 192, progressId } = req.body || {};
+    const { url, progressId } = req.body || {};
     if (!url || !ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid URL' });
     }
-    
+
     // Rate limiting: ensure minimum time between requests
     const now = Date.now();
     const timeSinceLastRequest = now - lastRequestTime;
     if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
       const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
-      console.log(`Rate limiting: waiting ${waitTime}ms before processing MP3 request`);
+      console.log(`Rate limiting: waiting ${waitTime}ms before processing request`);
       await new Promise(resolve => setTimeout(resolve, waitTime));
     }
     lastRequestTime = Date.now();
-    
+
     if (progressId) initProgress(progressId);
 
-    // Check if we have cookies - if so, go straight to youtube-dl-exec
-    const hasCookies = process.env.YTDLP_COOKIES_TEXT || process.env.YTDLP_COOKIES_BASE64 || process.env.YTDLP_COOKIES_FILE;
+    console.log('Getting video info for MP3...');
+    setProgress(progressId, { status: 'getting_info', percent: 10 });
+
+    const info = await ytdl.getInfo(url);
+    const videoTitle = info.videoDetails.title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_');
+    const tempFilename = `${videoTitle}-${Date.now()}-temp.mp4`;
+    const filename = `${videoTitle}-${Date.now()}.mp3`;
+    const tempFilepath = path.join(process.cwd(), 'downloads', tempFilename);
+    const filepath = path.join(process.cwd(), 'downloads', filename);
+
+    setProgress(progressId, { status: 'downloading', percent: 20 });
+
+    console.log('Starting audio download...');
+    const stream = ytdl(url, { 
+      quality: 'highestaudio',
+      filter: 'audioonly'
+    });
+
+    const writeStream = fs.createWriteStream(tempFilepath);
     
-    if (hasCookies) {
-      console.log('Cookies available, using youtube-dl-exec directly for MP3');
-      try {
-        const fallback = progressId
-          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId })
-          : await downloadWithYoutubeDl(url, { audioOnly: true, bitrateKbps: bitrate });
-        if (progressId) finishProgress(progressId, true, { file: fallback.filename });
-        return res.json(fallback);
-      } catch (fallbackErr) {
-        console.error('youtube-dl-exec failed with cookies for MP3:', fallbackErr.message);
-        if (progressId) finishProgress(progressId, false, { error: fallbackErr.message });
-        return res.status(500).json({ error: `youtube-dl-exec failed: ${fallbackErr.message}` });
-      }
-    }
-
-    // Fallback to original ytdl-core approach if no cookies
-    try {
-      const info = await ytdl.getInfo(url, { requestOptions: { headers: DEFAULT_HEADERS } });
-      const title = info.videoDetails.title.replace(/[<>:"/\\|?*]/g, '_');
-      const id = info.videoDetails.videoId;
-      const filename = `${title}-${id}.mp3`;
-      const outDir = path.join(process.cwd(), 'downloads');
-      ensureDir(outDir);
-      const outPath = path.join(outDir, filename);
-
-      const audioStream = ytdl(url, {
-        filter: 'audioonly',
-        quality: 'highestaudio',
-        dlChunkSize: 0,
-        highWaterMark: 1 << 26,
-        requestOptions: { headers: DEFAULT_HEADERS },
-        range: { start: 0 },
-        begin: '0s',
-      });
-
-      if (progressId) {
-        const startedAt = Date.now();
-        audioStream.on('progress', (_chunkLen, downloaded, total) => {
-          const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
-          const speed = downloaded / elapsed;
-          const remaining = Math.max(0, total - downloaded);
-          const etaSeconds = speed > 0 ? Math.round(remaining / speed) : null;
-          const percent = total ? (downloaded / total) * 100 : 0;
-          setProgress(progressId, { status: 'downloading', percent, etaSeconds });
+    let downloadedBytes = 0;
+    const totalBytes = parseInt(info.formats.find(f => f.quality === 'highestaudio')?.contentLength || '0');
+    
+    stream.on('data', (chunk) => {
+      downloadedBytes += chunk.length;
+      if (totalBytes > 0) {
+        const percent = Math.min(70, 20 + (downloadedBytes / totalBytes) * 50);
+        setProgress(progressId, { 
+          status: 'downloading', 
+          percent: Math.round(percent),
+          etaSeconds: totalBytes > 0 ? Math.round((totalBytes - downloadedBytes) / (downloadedBytes / (Date.now() - (progressStates.get(progressId)?.startedAt || Date.now()))) / 1000) : null
         });
       }
+    });
 
-      ffmpeg(audioStream)
-        .audioCodec('libmp3lame')
-        .audioBitrate(String(bitrate))
-        .format('mp3')
-        .outputOptions(['-threads 0'])
-        .on('error', async (err) => {
-          try {
-            const fallback = progressId
-              ? await downloadWithYoutubeDlStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId })
-              : await downloadWithYoutubeDl(url, { audioOnly: true, bitrateKbps: bitrate });
-            if (progressId) finishProgress(progressId, true, { file: filename });
-            res.json(fallback);
-          } catch (fallbackErr) {
-            if (progressId) finishProgress(progressId, false, { error: fallbackErr.message || err.message });
-            res.status(500).json({ error: fallbackErr.message || err.message });
-          }
-        })
-        .on('end', async () => {
-          if (progressId) finishProgress(progressId, true, { file: filename });
-          const fileUrl = await getFileUrl(outPath, filename);
-          res.json({ path: outPath, filename, url: fileUrl })
-        })
-        .save(outPath);
-    } catch (infoError) {
+    stream.on('end', async () => {
+      console.log('Audio download completed, converting to MP3...');
+      setProgress(progressId, { status: 'converting', percent: 80 });
+      
       try {
-        const fallback = req.body?.progressId
-          ? await downloadWithYoutubeDlStreaming(url, { audioOnly: true, bitrateKbps: bitrate, progressId: req.body.progressId })
-          : await downloadWithYoutubeDl(url, { audioOnly: true, bitrateKbps: bitrate });
-        if (req.body?.progressId) finishProgress(req.body.progressId, true);
-        return res.json(fallback);
-      } catch (fallbackErr) {
-        if (req.body?.progressId) finishProgress(req.body.progressId, false);
-        return res.status(500).json({ error: `Failed to get video info: ${infoError.message}; youtube-dl-exec fallback failed: ${fallbackErr.message}` });
+        // Convert to MP3 using ffmpeg
+        await new Promise((resolve, reject) => {
+          ffmpeg(tempFilepath)
+            .audioCodec('libmp3lame')
+            .audioBitrate(192)
+            .on('end', resolve)
+            .on('error', reject)
+            .save(filepath);
+        });
+        
+        console.log('MP3 conversion completed');
+        setProgress(progressId, { status: 'processing', percent: 95 });
+        
+        // Clean up temp file
+        try {
+          fs.unlinkSync(tempFilepath);
+        } catch (err) {
+          console.warn('Failed to cleanup temp file:', err.message);
+        }
+        
+        // Get the final URL
+        const finalUrl = getFileUrl(filename);
+        
+        finishProgress(progressId, true, { file: filename });
+        
+        res.json({
+          success: true,
+          filename,
+          url: finalUrl,
+          message: 'MP3 converted successfully'
+        });
+      } catch (err) {
+        console.error('MP3 conversion failed:', err.message);
+        finishProgress(progressId, false, { error: err.message });
+        res.status(500).json({ error: `MP3 conversion failed: ${err.message}` });
       }
-    }
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    });
+
+    stream.on('error', (err) => {
+      console.error('Audio download stream error:', err.message);
+      finishProgress(progressId, false, { error: err.message });
+      res.status(500).json({ error: `Audio download failed: ${err.message}` });
+    });
+
+    writeStream.on('error', (err) => {
+      console.error('Temp file write error:', err.message);
+      finishProgress(progressId, false, { error: err.message });
+      res.status(500).json({ error: `Temp file write failed: ${err.message}` });
+    });
+
+    stream.pipe(writeStream);
+
+  } catch (err) {
+    console.error('MP3 download endpoint error:', err.message);
+    if (progressId) finishProgress(progressId, false, { error: err.message });
+    res.status(500).json({ error: `MP3 download failed: ${err.message}` });
   }
 });
 
-const port = process.env.PORT || 5174;
-app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'YouTube Downloader Backend is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+const PORT = process.env.PORT || 5174;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Downloads directory: ${path.join(process.cwd(), 'downloads')}`);
+  console.log(`Storage: Local filesystem`);
+});
 
 
